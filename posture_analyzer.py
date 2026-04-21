@@ -1,345 +1,232 @@
 import cv2
 import numpy as np
-from sklearn.decomposition import PCA
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+MIN_CONTOUR_AREA = 4000
+ANGLE_THRESHOLD_DEG = 10
+SHOW_MASK = True
 
 
-MAX_KEYPOINTS = 100
-MIN_TRACKED_POINTS = 40
-FIXED_POINTS = 40
-CALIBRATION_TIME_SEC = 5
-DEVIATION_THRESHOLD = 50  # Tune as needed
-ROLLING_BUFFER_SIZE = 30
-
-def detect_keypoints(frame):
+def get_center_roi(frame):
     """
-    Detect Shi-Tomasi keypoints in a grayscale frame.
-    Returns Nx1x2 float32 array of points, or None if not found.
+    Restrict detection to the central region where the person is expected.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    points = cv2.goodFeaturesToTrack(
-        gray,
-        maxCorners=MAX_KEYPOINTS,
-        qualityLevel=0.01,
-        minDistance=7,
-        blockSize=7
-    )
-    return points
+    h, w = frame.shape[:2]
+    x1 = int(w * 0.20)
+    x2 = int(w * 0.80)
+    y1 = int(h * 0.10)
+    y2 = int(h * 0.95)
+    return x1, y1, x2, y2
 
 
-def track_keypoints(prev_frame, curr_frame, prev_points):
+def draw_center_roi(frame):
+    x1, y1, x2, y2 = get_center_roi(frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
+    cv2.putText(frame, "Detection Region", (x1, max(20, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+
+
+def preprocess_mask(mask):
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+
+def get_foreground_mask(frame, background):
     """
-    Track keypoints using KLT optical flow.
-    Returns:
-        good_new: Nx2 array of successfully tracked new points
-        good_old: Nx2 array of corresponding old points
+    Compute absolute difference from a stored background frame.
     """
-    if prev_points is None or len(prev_points) == 0:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    diff = cv2.absdiff(frame, background)
+    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
 
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    # Threshold difference image
+    _, mask = cv2.threshold(gray, 35, 255, cv2.THRESH_BINARY)
+    mask = preprocess_mask(mask)
 
-    next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-        prev_gray,
-        curr_gray,
-        prev_points,
-        None,
-        winSize=(15, 15),
-        maxLevel=2,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-    )
+    # Keep only the center region
+    x1, y1, x2, y2 = get_center_roi(frame)
+    roi_mask = np.zeros_like(mask)
+    roi_mask[y1:y2, x1:x2] = 255
+    mask = cv2.bitwise_and(mask, roi_mask)
 
-    # Optical flow can fail completely
-    if next_points is None or status is None:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
-
-    status = status.reshape(-1)
-    good_new = next_points[status == 1]
-    good_old = prev_points[status == 1]
-
-    if len(good_new) == 0:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
-
-    return good_new.reshape(-1, 2), good_old.reshape(-1, 2)
+    return mask
 
 
-def compute_feature_vector(points, fixed_points=FIXED_POINTS):
-    """
-    Given Nx2 array of keypoints, compute a centroid-normalized,
-    fixed-length flattened feature vector.
-
-    If there are fewer than fixed_points points, return None.
-    """
-    if points is None or len(points) < fixed_points:
+def get_largest_contour(mask, min_area=MIN_CONTOUR_AREA):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return None
 
-    # Use a fixed number of points so every feature vector has the same shape
-    points = points[:fixed_points]
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < min_area:
+        return None
 
-    centroid = np.mean(points, axis=0)
-    normed = points - centroid
-
-    # Optional scale normalization so moving slightly closer/farther affects less
-    scale = np.linalg.norm(normed, axis=1).mean()
-    if scale > 1e-6:
-        normed = normed / scale
-
-    return normed.flatten()
+    return largest
 
 
-def calibrate_pca(feature_list):
+def contour_to_points(contour):
+    return contour.reshape(-1, 2).astype(np.float32)
+
+
+def compute_body_axis(contour):
     """
-    Fit PCA to a list of feature vectors. Returns mean vector and PCA object.
+    PCA on contour points to get the body axis.
+    Chooses the eigenvector that is most aligned with vertical,
+    not just the one with the largest eigenvalue.
     """
-    valid = [f for f in feature_list if f is not None]
-    if len(valid) == 0:
-        raise ValueError("No valid calibration features collected.")
+    pts = contour.reshape(-1, 2).astype(np.float32)
+    if len(pts) < 2:
+        return None, None, None
 
-    # Keep only vectors that match the first valid shape
-    first_shape = valid[0].shape
-    valid = [f for f in valid if f.shape == first_shape]
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
 
-    if len(valid) == 0:
-        raise ValueError("Calibration features do not share a common shape.")
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
 
-    X = np.stack(valid)
+    # Two eigenvectors: choose the one more aligned with vertical
+    v1 = eigvecs[:, 0]
+    v2 = eigvecs[:, 1]
 
-    # n_components cannot exceed num_samples or num_features
-    n_components = min(10, X.shape[0], X.shape[1])
-    if n_components < 1:
-        raise ValueError("Not enough data to fit PCA.")
+    vertical = np.array([0.0, 1.0])
 
-    pca = PCA(n_components=n_components)
-    pca.fit(X)
+    if abs(np.dot(v1, vertical)) > abs(np.dot(v2, vertical)):
+        direction = v1
+    else:
+        direction = v2
 
-    mean_vec = np.mean(X, axis=0)
-    return mean_vec, pca
+    direction = direction / np.linalg.norm(direction)
+
+    # Force line to point upward/downward consistently
+    if direction[1] < 0:
+        direction = -direction
+
+    cx, cy = mean
+
+    cos_theta = np.clip(abs(np.dot(direction, vertical)), -1.0, 1.0)
+    angle_deg = np.degrees(np.arccos(cos_theta))
+
+    return (int(cx), int(cy)), direction, angle_deg
 
 
-def compute_deviation(feature_vector, mean_vec, pca):
-    """
-    Project feature_vector into PCA space, reconstruct, and compute L2 error.
-    """
-    if feature_vector is None or mean_vec is None or pca is None:
-        return 0.0
+def draw_axis(frame, center, direction, length=220, color=(0, 255, 0), thickness=3):
+    cx, cy = center
+    dx, dy = direction
 
-    # Safety check: feature shape must match the calibration shape
-    if feature_vector.shape != mean_vec.shape:
-        return 0.0
+    x1 = int(cx - length * dx)
+    y1 = int(cy - length * dy)
+    x2 = int(cx + length * dx)
+    y2 = int(cy + length * dy)
 
-    proj = pca.transform([feature_vector])
-    recon = pca.inverse_transform(proj)[0]
-    error = np.linalg.norm(feature_vector - recon)
-    return float(error)
+    cv2.line(frame, (x1, y1), (x2, y2), color, thickness)
+    cv2.circle(frame, (cx, cy), 5, (255, 255, 255), -1)
 
 
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        print("Error: could not open webcam.")
         return
 
-    prev_frame = None
-    prev_points = None
-
-    calibration_features = []
-    calibration_start = None
+    background = None
     calibrated = False
-    mean_vec = None
-    pca = None
+    baseline_angle = None
 
-    deviation_buffer = []
+    print("Instructions:")
+    print("1. Start program and leave camera view for 2 seconds.")
+    print("2. Press B to capture empty background.")
+    print("3. Sit in the detection region.")
+    print("4. Press C while sitting straight to calibrate.")
+    print("5. Press Q or ESC to quit.")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Error: Failed to grab frame.")
+            print("Error: failed to grab frame.")
             break
+
+        display = frame.copy()
+        draw_center_roi(display)
+
+        contour = None
+        mask = None
+
+        if background is not None:
+            mask = get_foreground_mask(frame, background)
+            contour = get_largest_contour(mask)
+
+            if contour is not None:
+                cv2.drawContours(display, [contour], -1, (255, 200, 0), 2)
+
+                center, direction, angle_deg = compute_body_axis(contour)
+
+                if center is not None:
+                    if calibrated and baseline_angle is not None:
+                        deviation = abs(angle_deg - baseline_angle)
+                        good_posture = deviation < ANGLE_THRESHOLD_DEG
+                        status = "Good Posture" if good_posture else "Bad Posture"
+                        color = (0, 255, 0) if good_posture else (0, 0, 255)
+                    else:
+                        deviation = angle_deg
+                        status = "Press C to calibrate"
+                        color = (0, 255, 255)
+
+                    draw_axis(display, center, direction, length=220, color=color, thickness=3)
+
+                    cv2.putText(display, f"Angle from vertical: {angle_deg:.1f} deg",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                    if calibrated and baseline_angle is not None:
+                        cv2.putText(display, f"Deviation: {deviation:.1f} deg",
+                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        cv2.putText(display, status,
+                                    (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+                    else:
+                        cv2.putText(display, "Sit straight, then press C",
+                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            else:
+                cv2.putText(display, "Body not detected clearly",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        else:
+            cv2.putText(display, "Press B to capture empty background",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(display, "Step out of the frame first",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        cv2.putText(display, "B = background   C = calibrate   Q/ESC = quit",
+                    (10, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (200, 200, 200), 2)
+
+        cv2.imshow("Posture Line Analyzer", display)
+        if SHOW_MASK and mask is not None:
+            cv2.imshow("Foreground Mask", mask)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC to quit
-            break
 
-        if not calibrated:
-            # Initialize or re-detect points if needed
-            if prev_points is None or len(prev_points) < MIN_TRACKED_POINTS:
-                prev_points = detect_keypoints(frame)
-                prev_frame = frame.copy()
+        if key == ord('b'):
+            background = frame.copy()
+            calibrated = False
+            baseline_angle = None
+            print("Background captured.")
 
-                # Start calibration timer only once for this calibration round
-                if calibration_start is None:
-                    calibration_start = cv2.getTickCount() / cv2.getTickFrequency()
-
-                cv2.putText(
-                    frame,
-                    "Calibrating... detecting points",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2
-                )
-                cv2.imshow("Posture Analyzer", frame)
-                continue
-
-            # Track keypoints
-            new_points, _ = track_keypoints(prev_frame, frame, prev_points)
-            prev_frame = frame.copy()
-
-            # If tracking failed badly, force re-detection next loop
-            if len(new_points) < MIN_TRACKED_POINTS:
-                prev_points = None
-                cv2.putText(
-                    frame,
-                    "Calibrating... re-detecting points",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2
-                )
-                cv2.imshow("Posture Analyzer", frame)
-                continue
-
-            prev_points = new_points.reshape(-1, 1, 2)
-
-            # Compute feature vector
-            feature_vec = compute_feature_vector(new_points)
-            if feature_vec is not None:
-                calibration_features.append(feature_vec)
-
-            # Draw keypoints
-            for pt in new_points:
-                cv2.circle(frame, tuple(pt.astype(int)), 3, (0, 255, 0), -1)
-
-            elapsed = (cv2.getTickCount() / cv2.getTickFrequency()) - calibration_start
-            cv2.putText(
-                frame,
-                f"Calibrating... {elapsed:.1f}s",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 255),
-                2
-            )
-            cv2.putText(
-                frame,
-                f"Tracked points: {len(new_points)}",
-                (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2
-            )
-            cv2.putText(
-                frame,
-                f"Samples: {len(calibration_features)}",
-                (10, 105),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2
-            )
-
-            if elapsed >= CALIBRATION_TIME_SEC:
-                if len(calibration_features) >= 20:
-                    try:
-                        mean_vec, pca = calibrate_pca(calibration_features)
-                        calibrated = True
-                        deviation_buffer = []
-                        print("Calibration complete.")
-                    except ValueError as e:
-                        print(f"Calibration failed: {e}")
-                        calibration_features = []
-                        calibration_start = None
-                        prev_points = None
+        elif key == ord('c'):
+            if contour is not None:
+                _, _, angle_deg = compute_body_axis(contour)
+                if angle_deg is not None:
+                    baseline_angle = angle_deg
+                    calibrated = True
+                    print(f"Calibrated baseline angle: {baseline_angle:.2f} deg")
                 else:
-                    print("Not enough calibration samples collected. Restarting calibration.")
-                    calibration_features = []
-                    calibration_start = None
-                    prev_points = None
+                    print("Could not calibrate: axis not found.")
+            else:
+                print("Could not calibrate: body contour not found.")
 
-            cv2.imshow("Posture Analyzer", frame)
-            continue
-
-        if prev_points is None or len(prev_points) < MIN_TRACKED_POINTS:
-            prev_points = detect_keypoints(frame)
-            prev_frame = frame.copy()
-
-            cv2.putText(
-                frame,
-                "Monitoring... detecting points",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2
-            )
-            cv2.imshow("Posture Analyzer", frame)
-            continue
-
-        # Track points
-        new_points, _ = track_keypoints(prev_frame, frame, prev_points)
-        prev_frame = frame.copy()
-
-        # If too many are lost, re-detect on next loop
-        if len(new_points) < MIN_TRACKED_POINTS:
-            prev_points = None
-            deviation_buffer.clear()
-
-            cv2.putText(
-                frame,
-                "Monitoring... re-detecting points",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2
-            )
-            cv2.imshow("Posture Analyzer", frame)
-            continue
-
-        prev_points = new_points.reshape(-1, 1, 2)
-
-        # Compute feature vector and deviation
-        feature_vec = compute_feature_vector(new_points)
-        deviation = compute_deviation(feature_vec, mean_vec, pca)
-
-        deviation_buffer.append(deviation)
-        if len(deviation_buffer) > ROLLING_BUFFER_SIZE:
-            deviation_buffer.pop(0)
-
-        smoothed = np.mean(deviation_buffer) if len(deviation_buffer) > 0 else 0.0
-
-        # Draw keypoints
-        for pt in new_points:
-            cv2.circle(frame, tuple(pt.astype(int)), 3, (0, 255, 0), -1)
-
-        # Display posture status
-        status_text = "Good Posture" if smoothed < DEVIATION_THRESHOLD else "Bad Posture"
-        color = (0, 255, 0) if status_text == "Good Posture" else (0, 0, 255)
-
-        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        cv2.putText(
-            frame,
-            f"Deviation: {smoothed:.2f}",
-            (10, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2
-        )
-        cv2.putText(
-            frame,
-            f"Tracked points: {len(new_points)}",
-            (10, 105),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.imshow("Posture Analyzer", frame)
+        elif key == ord('q') or key == 27:
+            break
 
     cap.release()
     cv2.destroyAllWindows()
