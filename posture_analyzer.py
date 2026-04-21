@@ -2,6 +2,11 @@ import cv2
 import numpy as np
 from sklearn.decomposition import PCA
 
+BLUR_KERNEL = 5                
+CANNY_LOW = 100                
+CANNY_HIGH = 200               
+CROP_RATIO = 0.6               
+THRESHOLD_VALUE = 127 
 
 MAX_KEYPOINTS = 100
 MIN_TRACKED_POINTS = 40
@@ -10,19 +15,54 @@ CALIBRATION_TIME_SEC = 5
 DEVIATION_THRESHOLD = 50  # Tune as needed
 ROLLING_BUFFER_SIZE = 30
 
-def detect_keypoints(frame):
+ALERT_CLEAR_THRESHOLD = 40    
+FRAMES_TO_CLEAR_ALERT = 90
+
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    blurred = cv2.GaussianBlur(gray, (BLUR_KERNEL, BLUR_KERNEL), 1)
+    frame_height = blurred.shape[0]
+    crop_height = int(frame_height * CROP_RATIO)
+    cropped = blurred[crop_height:, :]
+    edges = cv2.Canny(cropped, CANNY_LOW, CANNY_HIGH)
+
+    _, binary_mask = cv2.threshold(edges, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+    padding = np.zeros((frame_height - crop_height, frame.shape[1]), dtype=np.uint8)
+    edge_frame = np.vstack((edges, padding))
+
+    return edge_frame, binary_mask
+
+
+def detect_keypoints(frame, use_preprocessing=True):
     """
     Detect Shi-Tomasi keypoints in a grayscale frame.
     Returns Nx1x2 float32 array of points, or None if not found.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    points = cv2.goodFeaturesToTrack(
-        gray,
-        maxCorners=MAX_KEYPOINTS,
-        qualityLevel=0.01,
-        minDistance=7,
-        blockSize=7
-    )
+    if use_preprocessing:
+        # Apply preprocessing to isolate upper body
+        edge_frame, binary_mask = preprocess_frame(frame)
+        
+        # Detect Shi-Tomasi corners ONLY on the binary mask (isolated edges)
+        # This reduces background noise since we only search the thresholded region
+        points = cv2.goodFeaturesToTrack(
+            binary_mask,              # Search only on binary thresholded edges
+            maxCorners=MAX_KEYPOINTS,
+            qualityLevel=0.01,        # Min corner strength (0-1); lower = more points
+            minDistance=7,            # Min distance between corners (pixels)
+            blockSize=7               # Neighborhood size for corner detection
+        )
+    else:
+        # Original behavior: detect on raw grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        points = cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=MAX_KEYPOINTS,
+            qualityLevel=0.01,
+            minDistance=7,
+            blockSize=7
+        )
+    
     return points
 
 
@@ -122,7 +162,7 @@ def compute_deviation(feature_vector, mean_vec, pca):
     """
     if feature_vector is None or mean_vec is None or pca is None:
         return 0.0
-
+    
     # Safety check: feature shape must match the calibration shape
     if feature_vector.shape != mean_vec.shape:
         return 0.0
@@ -132,6 +172,49 @@ def compute_deviation(feature_vector, mean_vec, pca):
     error = np.linalg.norm(feature_vector - recon)
     return float(error)
 
+
+def draw_alert_overlay(frame, alert_active):
+    
+    if alert_active:
+        height, width = frame.shape[:2]
+        
+        cv2.rectangle(
+            frame,
+            (0, 0),                   
+            (width - 1, height - 1),  
+            (0, 0, 255),               
+            thickness=8               
+        )
+        
+        warning_text = "WARNING: POOR POSTURE DETECTED"
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        thickness = 2
+        text_size = cv2.getTextSize(warning_text, font, font_scale, thickness)[0]
+        
+        text_x = (width - text_size[0]) // 2
+        text_y = 40  
+
+        cv2.rectangle(
+            frame,
+            (text_x - 5, text_y - text_size[1] - 5),
+            (text_x + text_size[0] + 5, text_y + 5),
+            (0, 0, 255),              
+            -1                       
+        )
+        
+        cv2.putText(
+            frame,
+            warning_text,
+            (text_x, text_y),
+            font,
+            font_scale,
+            (255, 255, 255),          
+            thickness
+        )
+    
+    return frame
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -150,6 +233,9 @@ def main():
 
     deviation_buffer = []
 
+    alert_active = False
+    frames_below_threshold = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -163,7 +249,7 @@ def main():
         if not calibrated:
             # Initialize or re-detect points if needed
             if prev_points is None or len(prev_points) < MIN_TRACKED_POINTS:
-                prev_points = detect_keypoints(frame)
+                prev_points = detect_keypoints(frame, use_preprocessing=True)
                 prev_frame = frame.copy()
 
                 # Start calibration timer only once for this calibration round
@@ -213,6 +299,7 @@ def main():
                 cv2.circle(frame, tuple(pt.astype(int)), 3, (0, 255, 0), -1)
 
             elapsed = (cv2.getTickCount() / cv2.getTickFrequency()) - calibration_start
+
             cv2.putText(
                 frame,
                 f"Calibrating... {elapsed:.1f}s",
@@ -247,6 +334,11 @@ def main():
                         mean_vec, pca = calibrate_pca(calibration_features)
                         calibrated = True
                         deviation_buffer = []
+                        alert_active = False
+                        frames_below_threshold = 0
+                        
+                        # Save calibration to disk for future runs
+                        save_calibration(mean_vec, pca)
                         print("Calibration complete.")
                     except ValueError as e:
                         print(f"Calibration failed: {e}")
@@ -263,7 +355,7 @@ def main():
             continue
 
         if prev_points is None or len(prev_points) < MIN_TRACKED_POINTS:
-            prev_points = detect_keypoints(frame)
+            prev_points = detect_keypoints(frame, use_preprocessing=True)
             prev_frame = frame.copy()
 
             cv2.putText(
@@ -286,6 +378,8 @@ def main():
         if len(new_points) < MIN_TRACKED_POINTS:
             prev_points = None
             deviation_buffer.clear()
+            alert_active = False
+            frames_below_threshold = 0
 
             cv2.putText(
                 frame,
@@ -310,6 +404,20 @@ def main():
             deviation_buffer.pop(0)
 
         smoothed = np.mean(deviation_buffer) if len(deviation_buffer) > 0 else 0.0
+        
+       
+        if smoothed < ALERT_CLEAR_THRESHOLD:
+            frames_below_threshold += 1
+        else: 
+            frames_below_threshold = 0
+
+        if frames_below_threshold >= FRAMES_TO_CLEAR_ALERT:
+            alert_active = False
+            frames_below_threshold = 0
+        
+        if smoothed >= DEVIATION_THRESHOLD:
+            alert_active = True
+            frames_below_threshold = 0
 
         # Draw keypoints
         for pt in new_points:
@@ -339,6 +447,7 @@ def main():
             2
         )
 
+        frame = draw_alert_overlay(frame, alert_active)
         cv2.imshow("Posture Analyzer", frame)
 
     cap.release()
