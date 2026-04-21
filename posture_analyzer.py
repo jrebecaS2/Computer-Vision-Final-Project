@@ -2,67 +2,67 @@ import cv2
 import numpy as np
 from sklearn.decomposition import PCA
 
-BLUR_KERNEL = 5                
-CANNY_LOW = 100                
-CANNY_HIGH = 200               
-CROP_RATIO = 0.6               
-THRESHOLD_VALUE = 127 
 
 MAX_KEYPOINTS = 100
 MIN_TRACKED_POINTS = 40
 FIXED_POINTS = 40
 CALIBRATION_TIME_SEC = 5
-DEVIATION_THRESHOLD = 50  # Tune as needed
+DEVIATION_THRESHOLD = 4  # Relative to calibration baseline (positive = bad posture)
 ROLLING_BUFFER_SIZE = 30
 
-ALERT_CLEAR_THRESHOLD = 40    
-FRAMES_TO_CLEAR_ALERT = 90
+# Person 1 — Vision Pipeline: Image Preprocessing Parameters
+BLUR_KERNEL = 5  # Gaussian blur kernel size (must be odd)
+CANNY_LOW = 80  # Lower threshold for edge detection (lowered to catch shoulder edges)
+CANNY_HIGH = 200  # Upper threshold for edge detection
+CROP_RATIO = 0.75  # Crop to top N% of frame (0.75 = top 75% includes head + shoulders)
+THRESHOLD_VALUE = 127  # Binary threshold for edge map
 
 def preprocess_frame(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    blurred = cv2.GaussianBlur(gray, (BLUR_KERNEL, BLUR_KERNEL), 1)
-    frame_height = blurred.shape[0]
-    crop_height = int(frame_height * CROP_RATIO)
-    cropped = blurred[crop_height:, :]
-    edges = cv2.Canny(cropped, CANNY_LOW, CANNY_HIGH)
-
-    _, binary_mask = cv2.threshold(edges, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
-    padding = np.zeros((frame_height - crop_height, frame.shape[1]), dtype=np.uint8)
-    edge_frame = np.vstack((edges, padding))
-
-    return edge_frame, binary_mask
-
-
-def detect_keypoints(frame, use_preprocessing=True):
     """
-    Detect Shi-Tomasi keypoints in a grayscale frame.
+    Preprocess frame to isolate upper-body region and edge map.
+    Pipeline: Gaussian blur → Canny edge detection → upper-body crop → binary threshold.
+    
+    Returns:
+        edge_frame: Edge map of isolated upper-body region
+        mask: Binary mask where body edges are white (255), background is black (0)
+    """
+    # Step 1: Gaussian blur for noise reduction
+    blurred = cv2.GaussianBlur(frame, (BLUR_KERNEL, BLUR_KERNEL), 0)
+    
+    # Step 2: Convert to grayscale
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    
+    # Step 3: Canny edge detection
+    edges = cv2.Canny(gray, CANNY_LOW, CANNY_HIGH)
+    
+    # Step 4: Crop to upper-body region (top CROP_RATIO of frame)
+    h, w = edges.shape
+    crop_h = int(h * CROP_RATIO)
+    edges_cropped = edges[:crop_h, :]
+    
+    # Step 5: Binary threshold to isolate dominant body blob
+    _, binary_mask = cv2.threshold(edges_cropped, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+    
+    return edges_cropped, binary_mask
+
+
+def detect_keypoints(frame):
+    """
+    Detect Shi-Tomasi keypoints on preprocessed upper-body region.
+    Applies preprocessing pipeline (blur → Canny → crop → threshold) before corner detection.
     Returns Nx1x2 float32 array of points, or None if not found.
     """
-    if use_preprocessing:
-        # Apply preprocessing to isolate upper body
-        edge_frame, binary_mask = preprocess_frame(frame)
-        
-        # Detect Shi-Tomasi corners ONLY on the binary mask (isolated edges)
-        # This reduces background noise since we only search the thresholded region
-        points = cv2.goodFeaturesToTrack(
-            binary_mask,              # Search only on binary thresholded edges
-            maxCorners=MAX_KEYPOINTS,
-            qualityLevel=0.01,        # Min corner strength (0-1); lower = more points
-            minDistance=7,            # Min distance between corners (pixels)
-            blockSize=7               # Neighborhood size for corner detection
-        )
-    else:
-        # Original behavior: detect on raw grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        points = cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=MAX_KEYPOINTS,
-            qualityLevel=0.01,
-            minDistance=7,
-            blockSize=7
-        )
+    # Preprocess frame to isolate upper body
+    edges, mask = preprocess_frame(frame)
     
+    # Run Shi-Tomasi corner detection on binary mask (isolated body region)
+    points = cv2.goodFeaturesToTrack(
+        mask,
+        maxCorners=MAX_KEYPOINTS,
+        qualityLevel=0.01,
+        minDistance=7,
+        blockSize=7
+    )
     return points
 
 
@@ -129,7 +129,11 @@ def compute_feature_vector(points, fixed_points=FIXED_POINTS):
 
 def calibrate_pca(feature_list):
     """
-    Fit PCA to a list of feature vectors. Returns mean vector and PCA object.
+    Fit PCA to a list of feature vectors. 
+    Returns: mean_vec, pca, baseline_deviation (mean error of training data)
+    
+    baseline_deviation is the average PCA reconstruction error on training data.
+    Used later to compute RELATIVE deviation from the calibration baseline.
     """
     valid = [f for f in feature_list if f is not None]
     if len(valid) == 0:
@@ -153,16 +157,32 @@ def calibrate_pca(feature_list):
     pca.fit(X)
 
     mean_vec = np.mean(X, axis=0)
-    return mean_vec, pca
-
-
-def compute_deviation(feature_vector, mean_vec, pca):
-    """
-    Project feature_vector into PCA space, reconstruct, and compute L2 error.
-    """
-    if feature_vector is None or mean_vec is None or pca is None:
-        return 0.0
     
+    # Compute baseline deviation: mean reconstruction error on training data
+    # This represents the inherent PCA error for good posture
+    baseline_errors = []
+    for feature in valid:
+        proj = pca.transform([feature])
+        recon = pca.inverse_transform(proj)[0]
+        error = np.linalg.norm(feature - recon)
+        baseline_errors.append(error)
+    
+    baseline_deviation = np.mean(baseline_errors)
+    
+    return mean_vec, pca, baseline_deviation
+
+
+def compute_deviation(feature_vector, mean_vec, pca, baseline_deviation):
+    """
+    Project feature_vector into PCA space, reconstruct, and compute RELATIVE L2 error.
+    
+    Returns the deviation relative to the calibration baseline.
+    - 0 or negative: same as calibration posture (good)
+    - Positive and large: different from calibration (bad)
+    """
+    if feature_vector is None or mean_vec is None or pca is None or baseline_deviation is None:
+        return 0.0
+
     # Safety check: feature shape must match the calibration shape
     if feature_vector.shape != mean_vec.shape:
         return 0.0
@@ -170,51 +190,13 @@ def compute_deviation(feature_vector, mean_vec, pca):
     proj = pca.transform([feature_vector])
     recon = pca.inverse_transform(proj)[0]
     error = np.linalg.norm(feature_vector - recon)
-    return float(error)
-
-
-def draw_alert_overlay(frame, alert_active):
     
-    if alert_active:
-        height, width = frame.shape[:2]
-        
-        cv2.rectangle(
-            frame,
-            (0, 0),                   
-            (width - 1, height - 1),  
-            (0, 0, 255),               
-            thickness=8               
-        )
-        
-        warning_text = "WARNING: POOR POSTURE DETECTED"
-        
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.9
-        thickness = 2
-        text_size = cv2.getTextSize(warning_text, font, font_scale, thickness)[0]
-        
-        text_x = (width - text_size[0]) // 2
-        text_y = 40  
-
-        cv2.rectangle(
-            frame,
-            (text_x - 5, text_y - text_size[1] - 5),
-            (text_x + text_size[0] + 5, text_y + 5),
-            (0, 0, 255),              
-            -1                       
-        )
-        
-        cv2.putText(
-            frame,
-            warning_text,
-            (text_x, text_y),
-            font,
-            font_scale,
-            (255, 255, 255),          
-            thickness
-        )
+    # Return RELATIVE deviation: current error minus baseline
+    # This will be ~0 for good posture, and positive/large for bad posture
+    relative_error = error - baseline_deviation
     
-    return frame
+    return float(relative_error)
+
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -230,11 +212,9 @@ def main():
     calibrated = False
     mean_vec = None
     pca = None
+    baseline_deviation = None
 
     deviation_buffer = []
-
-    alert_active = False
-    frames_below_threshold = 0
 
     while True:
         ret, frame = cap.read()
@@ -249,7 +229,7 @@ def main():
         if not calibrated:
             # Initialize or re-detect points if needed
             if prev_points is None or len(prev_points) < MIN_TRACKED_POINTS:
-                prev_points = detect_keypoints(frame, use_preprocessing=True)
+                prev_points = detect_keypoints(frame)
                 prev_frame = frame.copy()
 
                 # Start calibration timer only once for this calibration round
@@ -299,7 +279,6 @@ def main():
                 cv2.circle(frame, tuple(pt.astype(int)), 3, (0, 255, 0), -1)
 
             elapsed = (cv2.getTickCount() / cv2.getTickFrequency()) - calibration_start
-
             cv2.putText(
                 frame,
                 f"Calibrating... {elapsed:.1f}s",
@@ -331,15 +310,10 @@ def main():
             if elapsed >= CALIBRATION_TIME_SEC:
                 if len(calibration_features) >= 20:
                     try:
-                        mean_vec, pca = calibrate_pca(calibration_features)
+                        mean_vec, pca, baseline_deviation = calibrate_pca(calibration_features)
                         calibrated = True
                         deviation_buffer = []
-                        alert_active = False
-                        frames_below_threshold = 0
-                        
-                        # Save calibration to disk for future runs
-                        save_calibration(mean_vec, pca)
-                        print("Calibration complete.")
+                        print(f"Calibration complete. Baseline deviation: {baseline_deviation:.3f}")
                     except ValueError as e:
                         print(f"Calibration failed: {e}")
                         calibration_features = []
@@ -355,7 +329,7 @@ def main():
             continue
 
         if prev_points is None or len(prev_points) < MIN_TRACKED_POINTS:
-            prev_points = detect_keypoints(frame, use_preprocessing=True)
+            prev_points = detect_keypoints(frame)
             prev_frame = frame.copy()
 
             cv2.putText(
@@ -378,8 +352,6 @@ def main():
         if len(new_points) < MIN_TRACKED_POINTS:
             prev_points = None
             deviation_buffer.clear()
-            alert_active = False
-            frames_below_threshold = 0
 
             cv2.putText(
                 frame,
@@ -397,27 +369,13 @@ def main():
 
         # Compute feature vector and deviation
         feature_vec = compute_feature_vector(new_points)
-        deviation = compute_deviation(feature_vec, mean_vec, pca)
+        deviation = compute_deviation(feature_vec, mean_vec, pca, baseline_deviation)
 
         deviation_buffer.append(deviation)
         if len(deviation_buffer) > ROLLING_BUFFER_SIZE:
             deviation_buffer.pop(0)
 
         smoothed = np.mean(deviation_buffer) if len(deviation_buffer) > 0 else 0.0
-        
-       
-        if smoothed < ALERT_CLEAR_THRESHOLD:
-            frames_below_threshold += 1
-        else: 
-            frames_below_threshold = 0
-
-        if frames_below_threshold >= FRAMES_TO_CLEAR_ALERT:
-            alert_active = False
-            frames_below_threshold = 0
-        
-        if smoothed >= DEVIATION_THRESHOLD:
-            alert_active = True
-            frames_below_threshold = 0
 
         # Draw keypoints
         for pt in new_points:
@@ -447,7 +405,6 @@ def main():
             2
         )
 
-        frame = draw_alert_overlay(frame, alert_active)
         cv2.imshow("Posture Analyzer", frame)
 
     cap.release()
