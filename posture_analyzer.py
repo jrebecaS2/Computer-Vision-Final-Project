@@ -19,11 +19,6 @@ THRESHOLD_VALUE = 127
 def preprocess_frame(frame):
     """
     Preprocess frame to isolate upper-body region and edge map.
-    Pipeline: Gaussian blur Canny edge detection upper-body crop binary threshold.
-    
-    Returns:
-        edge_frame: Edge map of isolated upper-body region
-        mask: Binary mask where body edges are white (255), background is black (0)
     """
     #gaussian blur for noise reduction
     blurred = cv2.GaussianBlur(frame, (BLUR_KERNEL, BLUR_KERNEL), 0)
@@ -43,7 +38,7 @@ def preprocess_frame(frame):
 
 def detect_keypoints(frame):
     """
-    Detect Shi-Tomasi keypoints on preprocessed upper-body region.
+    Detect Shi-Tomasi keypoints on upper-body region.
     """
     edges, mask = preprocess_frame(frame)
     
@@ -61,9 +56,6 @@ def detect_keypoints(frame):
 def track_keypoints(prev_frame, curr_frame, prev_points):
     """
     Track keypoints using KLT optical flow.
-    Returns:
-        good_new: Nx2 array of successfully tracked new points
-        good_old: Nx2 array of corresponding old points
     """
     if prev_points is None or len(prev_points) == 0:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
@@ -96,21 +88,17 @@ def track_keypoints(prev_frame, curr_frame, prev_points):
 
 def compute_feature_vector(points, fixed_points=FIXED_POINTS):
     """
-    Given Nx2 array of keypoints, compute a centroid-normalized,
-    fixed-length flattened feature vector.
-
-    If there are fewer than fixed_points points, return None.
+    compute a centroid-normalized, fixed-length flattened feature vector.
     """
     if points is None or len(points) < fixed_points:
         return None
 
-    # Use a fixed number of points so every feature vector has the same shape
     points = points[:fixed_points]
 
     centroid = np.mean(points, axis=0)
     normed = points - centroid
 
-    # Optional scale normalization so moving slightly closer/farther affects less
+    # Optional scale normalization
     scale = np.linalg.norm(normed, axis=1).mean()
     if scale > 1e-6:
         normed = normed / scale
@@ -121,16 +109,11 @@ def compute_feature_vector(points, fixed_points=FIXED_POINTS):
 def calibrate_pca(feature_list):
     """
     Fit PCA to a list of feature vectors. 
-    Returns: mean_vec, pca, baseline_deviation (mean error of training data)
-    
-    baseline_deviation is the average PCA reconstruction error on training data.
-    Used later to compute RELATIVE deviation from the calibration baseline.
     """
     valid = [f for f in feature_list if f is not None]
     if len(valid) == 0:
         raise ValueError("No valid calibration features collected.")
-
-    # Keep only vectors that match the first valid shape
+    
     first_shape = valid[0].shape
     valid = [f for f in valid if f.shape == first_shape]
 
@@ -163,10 +146,6 @@ def calibrate_pca(feature_list):
 def compute_deviation(feature_vector, mean_vec, pca, baseline_deviation):
     """
     Project feature_vector into PCA space, reconstruct, and compute RELATIVE L2 error.
-    
-    Returns the deviation relative to the calibration baseline.
-    - 0 or negative: same as calibration posture (good)
-    - Positive and large: different from calibration (bad)
     """
     if feature_vector is None or mean_vec is None or pca is None or baseline_deviation is None:
         return 0.0
